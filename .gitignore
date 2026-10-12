@@ -1,0 +1,13 @@
+# Compiled Binaries & Object Files
+*.o
+*.out
+*.exe
+load_balancer
+threadpool_test
+cpu_medium
+build/
+
+# IDE / OS specific
+.DS_Store
+.vscode/
+.idea/
