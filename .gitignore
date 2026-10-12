@@ -5,6 +5,7 @@
 load_balancer
 threadpool_test
 cpu_medium
+test_*
 build/
 
 # IDE / OS specific
