@@ -355,4 +355,117 @@ You do **not** need to write scheduling logic that routes tasks to physical CPU 
 2. **The OS Kernel**: Decides which **Physical CPU Core** executes that worker.
 3. If CPU Affinity is configured once at startup (`Worker 0 = Core 0`, `Worker 1 = Core 1`), assigning a task to `Worker 0` automatically routes it to `Core 0` with zero runtime math!
 
+---
+
+## 16. Semaphores (`sem_t`) vs. Condition Variables (`pthread_cond_t`)
+
+Can a counting semaphore be used in a thread pool? **Yes, conceptually**, but `pthread_cond_t` is the industry standard for 3 critical reasons:
+
+| Feature | Semaphore (`sem_t`) | Mutex + Cond Var (`pthread_cond_t`) |
+| :--- | :--- | :--- |
+| **Protects Queue Memory?** | No (still requires a separate mutex) | **Yes (via paired mutex)** |
+| **Wake ALL Workers at Once?** | No (must loop `sem_post()` $N$ times) | **Yes (`pthread_cond_broadcast`)** |
+| **Compound Boolean Checks?** | No (strictly an integer counter) | **Yes (`while(empty && !shutdown)`)** |
+| **macOS Native Compatibility** | ❌ Broken (`sem_init` returns `ENOSYS`) | **100% Native on Linux & macOS** |
+
+---
+
+## 17. Deadlock Prevention: The 4 Golden Rules
+
+Deadlocks occur when threads are permanently blocked waiting for resources held by one another. We prevent deadlocks using 4 strict architectural rules:
+
+1. **The Single Mutex Rule**: Use only one mutex (`pool->lock`) for the queue. Circular wait (*Thread A waits for Lock 2 while Thread B waits for Lock 1*) is mathematically impossible with a single lock.
+2. **Unlock BEFORE Running Tasks (Crucial!)**:
+   * Worker grabs the lock, pops the task (takes ~10 nanoseconds), and **unlocks the mutex immediately**.
+   * The task function `task.function(task.arg)` executes with **zero locks held**.
+3. **Always Check Conditions in a `while` Loop**: Prevents missed wakeups and spurious kernel wakeups.
+4. **Broadcast on Shutdown**: Use `pthread_cond_broadcast(&has_work)` during cleanup so no worker is left sleeping in kernel space forever.
+
+---
+
+## 18. Thrashing & The 4 Architectural Safeguards
+
+**Thrashing** occurs when the system spends more time managing overhead than performing productive work.
+
+| Thrashing Type | Root Cause | Our Architectural Safeguard |
+| :--- | :--- | :--- |
+| **CPU Context-Switch Thrashing** | Spawning too many threads fighting for CPU cores | **Fixed thread count bounded to physical cores** ($N_{\text{threads}} = N_{\text{cores}}$). |
+| **L1/L2 Cache Churn Thrashing** | Threads bouncing between cores, flushing cache lines | **CPU Affinity (Thread Pinning)** binds workers to permanent cores. |
+| **Hardware Bus / False Sharing** | Different cores modifying variables on the same 64-byte line | **64-Byte Cache-Line Alignment** (`__attribute__((aligned(64)))`) isolates worker memory. |
+| **Lock Contention Thrashing** | Workers holding mutexes during execution | **Microsecond critical sections**: hold lock only to pop pointer, release before execution. |
+
+---
+
+## 19. Measuring "Load" in Least-Loaded Scheduling
+
+### Why Avoid OS CPU % (`/proc/stat`)?
+* **Slow**: Syscalls take ~100,000 nanoseconds.
+* **Laggy**: Averages past 100ms–1000ms history; cannot predict immediate backlog.
+
+### The Gold-Standard Metric: In-Flight Workload
+Calculated directly in RAM in **~2 nanoseconds**:
+$$\text{Load}(W_i) = \text{Tasks Queued}(W_i) + \text{Currently Executing}(W_i)$$
+
+### The "Unknown Task Duration" Paradox (Halting Problem)
+You cannot predict a task's exact runtime before execution. Systems handle this via:
+1. **Pull-Based FIFO Queues**: Fastest workers automatically absorb more tasks without needing to predict weight.
+2. **Runtime Feedback**: Learning historical average runtime for recurring task types.
+3. **Work Stealing**: Dynamically stealing tasks from workers stuck on unexpectedly heavy jobs.
+
+---
+
+## 20. Centralized Pull Queue (Bank) vs. Distributed Work Stealing (Supermarket)
+
+```mermaid
+flowchart TD
+    subgraph Model1 ["Bank Model: Centralized Pull Queue (Solution 1)"]
+        CQ["1 Shared Queue (1 Mutex)"] --> W1["Worker 1"]
+        CQ --> W2["Worker 2"]
+        CQ --> W3["Worker 3"]
+    end
+
+    subgraph Model2 ["Supermarket Model: Work Stealing (Solution 3)"]
+        Q1["Queue 1"] --> W4["Worker 1"]
+        Q2["Queue 2"] --> W5["Worker 2"]
+        W4 -.->|Steals from back| Q2
+    end
+```
+
+* **Centralized Pull Queue (Our Architecture)**:
+  * 1 shared queue in RAM. Workers pull tasks when free.
+  * **Self-balancing**: A 10-second task ties up 1 worker while others finish 50 quick tasks.
+  * Ideal for 2 to 16 CPU cores. Clean, bulletproof, zero wasted worker capacity.
+* **Work Stealing (Advanced Multi-Core Runtimes)**:
+  * Each worker has a private queue (Deque). Workers steal from other queues only when their own queue is empty.
+  * Scales to 64–128+ cores (used by Go runtime, Rust Tokio, Java ForkJoinPool).
+
+---
+
+## 21. Scheduling Policy Trade-Offs: Round-Robin vs. Least-Loaded
+
+* **Round-Robin (`SCHEDULE_ROUND_ROBIN`)**:
+  * Rotates tasks strictly: Worker 0 $\rightarrow$ Worker 1 $\rightarrow$ Worker 2 $\rightarrow$ Worker 0.
+  * **Vulnerable to Head-of-Line Blocking (Convoy Effect)**: If a 2-second task is assigned to Worker 0, a 0.01-second task assigned next to Worker 0 gets stuck waiting behind it even if Worker 1 is completely idle.
+* **Least-Loaded (`SCHEDULE_LEAST_LOADED` / First-Available)**:
+  * Routes new tasks to whichever worker currently has the lowest in-flight workload.
+  * Light tasks immediately bypass busy workers and finish with zero latency.
+
+---
+
+## 22. Predictive Scheduling & Runtime Learning (EMA)
+
+### A. The Blind Spot of Count-Based Least-Loaded
+If Worker 1 has 1 light task (2 ms) and Worker 2 has 1 heavy task (2,000 ms), simple queue-count scheduling considers both equally loaded (`count = 1`). New tasks could mistakenly be sent to Worker 2.
+
+### B. The 3 Core Steps of Predictive Scheduling
+1. **Task Categorization**: Each task carries an integer `task_type` or identifier.
+2. **Runtime Profiling & EMA Learning**: When tasks complete, record elapsed time and update an **Exponential Moving Average**:
+   $$\text{PredictedTime} = (1 - \alpha) \times \text{OldPredicted} + \alpha \times \text{ActualDuration}$$
+   * Smooths out outliers and naturally adapts if input sizes or CPU frequencies drift.
+3. **Estimated Backlog Dispatching**:
+   $$\text{Backlog}(W_i) = \sum_{t \in Q_i} \text{PredictedDuration}(t.\text{type}) + \text{EstimatedRemainingCurrent}(W_i)$$
+   The dispatcher routes incoming tasks to whichever worker has the **lowest total predicted time in milliseconds**, rather than just the lowest count.
+
+
+
 
