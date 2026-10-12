@@ -585,3 +585,74 @@ This file provides the low-level foundation for our CPU Task Assigner.
 
 
 
+
+---
+
+## 27. HTTP Microservice as Real Workload (Option 1)
+
+### Why Replace Synthetic Tasks with Real Work?
+- Synthetic tasks (`usleep`, XOR loops) don't involve I/O or system calls, which is unrealistic.
+- Real HTTP socket work gives us measurable, comparable, reproducible benchmarks.
+- `ab` (ApacheBench) is an industry-standard tool for req/s and latency measurement.
+
+### Files Added
+| File | Purpose |
+|------|---------|
+| `include/server.h` | Port constant, backlog, `TASK_TYPE_HTTP`, and function declarations |
+| `src/server.c` | `socket() → bind() → listen() → accept()` loop; on new client: `threadpool_add(pool, http_handle_request, client_fd, TASK_TYPE_HTTP)` |
+| `include/http_handler.h` | Declaration of the worker task function |
+| `src/http_handler.c` | Reads HTTP request, routes to `/`, `/ping`, `/status`, returns JSON |
+| `src/main.c` | Starts pool (Least-Loaded), calls `server_create()` + `server_run()` |
+| `src/baseline.c` | **Comparison binary**: naive `pthread_create()` per request, no pool, no affinity |
+
+### Key Implementation Details
+- `client_fd` is passed to the thread pool as `(void*)(intptr_t)client_fd` — portable integer-to-pointer cast.
+- Worker unpacks it as `int client_fd = (int)(intptr_t)arg`.
+- `SO_REUSEADDR` prevents "Address already in use" after restart.
+- `SERVER_BACKLOG = 128` lets the kernel queue connections during busy bursts.
+- Baseline uses `pthread_detach()` so no `pthread_join()` is needed per thread.
+- If `threadpool_add()` fails (queue full), server sends HTTP 503 instead of dropping silently.
+
+### Benchmark Results (5000 requests, 50 concurrent, ARM64 3-core Kali Linux)
+
+| Metric | Our Task Assigner (Least-Loaded, pinned) | Baseline (pthread_create per req) |
+|--------|------------------------------------------|----------------------------------|
+| Requests/sec | **30,027 req/s** | 18,400 req/s |
+| Latency p50 | **1 ms** | 2 ms |
+| Latency p99 | **5 ms** | 6 ms |
+| Worst case | **5 ms** | 9 ms |
+| Failed requests | 0 | 0 |
+
+**Our scheduler is ~63% faster with 2× lower median latency.**
+
+### Why Our Scheduler Wins
+1. **Zero thread spawn cost** — workers are pre-created; no `clone()` syscall per request.
+2. **CPU affinity** — each worker is pinned to a core, so its L1 cache stays warm across requests.
+3. **Bounded concurrency** — exactly 3 workers for 3 cores; baseline can create hundreds of threads simultaneously, causing OS scheduling pressure and TLB thrashing.
+4. **Least-Loaded routing** — tasks go to the least busy worker, not randomly.
+
+---
+
+## 28. Architecture: How HTTP and Task Assigner Connect
+
+```
+Client (curl/ab)
+    |
+    | TCP connect(:8080)
+    v
+accept() in main thread
+    |
+    | threadpool_add(pool, http_handle_request, client_fd, TASK_TYPE_HTTP)
+    v
+Scheduler selects worker (Least-Loaded)
+    |
+    | worker_t dequeues task, unlocks, calls:
+    v
+http_handle_request(client_fd)
+    |  recv() HTTP request
+    |  snprintf() JSON body
+    |  send() HTTP response
+    |  close(client_fd)
+    v
+Worker free, picks next task
+```

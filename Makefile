@@ -24,15 +24,22 @@ CC ?= gcc
 CFLAGS = -Wall -Wextra -Iinclude -pthread
 LDFLAGS = -pthread -lm
 
-SRCS = src/threadpool.c src/scheduler.c src/main.c
+SRCS = src/threadpool.c src/scheduler.c src/server.c src/http_handler.c src/main.c
 TARGET = load_balancer
 
 # Default: Optimized release build
 all: CFLAGS += -O2
 all: $(TARGET)
 
+BASELINE_SRCS = src/http_handler.c src/baseline.c
+
+all: $(TARGET) baseline
+
 $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) $(SRCS) $(LDFLAGS) -o $(TARGET)
+
+baseline: $(BASELINE_SRCS)
+	$(CC) $(CFLAGS) $(BASELINE_SRCS) $(LDFLAGS) -o baseline
 
 # Memory Safety Build (Catches memory leaks, out-of-bounds, use-after-free)
 asan: CFLAGS += -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
@@ -48,6 +55,6 @@ run: all
 
 # Clean build artifacts
 clean:
-	rm -f $(TARGET) *.o
+	rm -f $(TARGET) baseline *.o
 
 .PHONY: all asan tsan run clean
