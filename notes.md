@@ -588,71 +588,79 @@ This file provides the low-level foundation for our CPU Task Assigner.
 
 ---
 
-## 27. HTTP Microservice as Real Workload (Option 1)
+## 27. HTTP Microservice as Real-World Workload
 
-### Why Replace Synthetic Tasks with Real Work?
-- Synthetic tasks (`usleep`, XOR loops) don't involve I/O or system calls, which is unrealistic.
-- Real HTTP socket work gives us measurable, comparable, reproducible benchmarks.
-- `ab` (ApacheBench) is an industry-standard tool for req/s and latency measurement.
+### A. Motivation: Synthetic vs. Real-World Workloads
+- Synthetic tasks (`usleep`, XOR loops) helped verify scheduler mechanics (Round-Robin, Least-Loaded, Predictive EMA, and parallel speedup) in pure memory.
+- However, real network systems contend with kernel sockets, system call overhead, network buffers, client concurrency, and OS I/O events.
+- To measure real-world performance, we implemented an HTTP/1.1 microservice where each incoming TCP connection becomes a task scheduled to the thread pool.
 
-### Files Added
-| File | Purpose |
-|------|---------|
-| `include/server.h` | Port constant, backlog, `TASK_TYPE_HTTP`, and function declarations |
-| `src/server.c` | `socket() → bind() → listen() → accept()` loop; on new client: `threadpool_add(pool, http_handle_request, client_fd, TASK_TYPE_HTTP)` |
-| `include/http_handler.h` | Declaration of the worker task function |
-| `src/http_handler.c` | Reads HTTP request, routes to `/`, `/ping`, `/status`, returns JSON |
-| `src/main.c` | Starts pool (Least-Loaded), calls `server_create()` + `server_run()` |
-| `src/baseline.c` | **Comparison binary**: naive `pthread_create()` per request, no pool, no affinity |
+### B. Implementation Breakdown
+| File | Role |
+|------|------|
+| `include/server.h` / `src/server.c` | TCP listening socket creation (`socket()`, `setsockopt(SO_REUSEADDR)`, `bind()`, `listen()`) and `accept()` loop running on the main thread. |
+| `include/http_handler.h` / `src/http_handler.c` | The task function executed by workers: reads HTTP request, routes endpoints (`/`, `/ping`, `/status`), formats JSON response with active CPU core ID, and closes client socket. |
+| `src/main.c` | Instantiates thread pool with `SCHEDULE_LEAST_LOADED`, creates server on port `8080`, and handles graceful shutdown via `SIGINT`. |
+| `src/baseline.c` | The comparison server on port `8081` using naive on-demand `pthread_create()` per connection (no thread pool, no CPU pinning, relying 100% on native Linux scheduling). |
 
-### Key Implementation Details
-- `client_fd` is passed to the thread pool as `(void*)(intptr_t)client_fd` — portable integer-to-pointer cast.
-- Worker unpacks it as `int client_fd = (int)(intptr_t)arg`.
-- `SO_REUSEADDR` prevents "Address already in use" after restart.
-- `SERVER_BACKLOG = 128` lets the kernel queue connections during busy bursts.
-- Baseline uses `pthread_detach()` so no `pthread_join()` is needed per thread.
-- If `threadpool_add()` fails (queue full), server sends HTTP 503 instead of dropping silently.
+### C. Handing Off File Descriptors via `intptr_t`
+The thread pool task signature accepts a generic `void *arg`. A socket file descriptor is an integer (`int`). To pass it safely on 64-bit systems without memory allocation or truncation:
+```c
+// Submitting task (main thread):
+threadpool_add(pool, http_handle_request, (void *)(intptr_t)client_fd, TASK_TYPE_HTTP);
 
-### Benchmark Results (5000 requests, 50 concurrent, ARM64 3-core Kali Linux)
-
-| Metric | Our Task Assigner (Least-Loaded, pinned) | Baseline (pthread_create per req) |
-|--------|------------------------------------------|----------------------------------|
-| Requests/sec | **30,027 req/s** | 18,400 req/s |
-| Latency p50 | **1 ms** | 2 ms |
-| Latency p99 | **5 ms** | 6 ms |
-| Worst case | **5 ms** | 9 ms |
-| Failed requests | 0 | 0 |
-
-**Our scheduler is ~63% faster with 2× lower median latency.**
-
-### Why Our Scheduler Wins
-1. **Zero thread spawn cost** — workers are pre-created; no `clone()` syscall per request.
-2. **CPU affinity** — each worker is pinned to a core, so its L1 cache stays warm across requests.
-3. **Bounded concurrency** — exactly 3 workers for 3 cores; baseline can create hundreds of threads simultaneously, causing OS scheduling pressure and TLB thrashing.
-4. **Least-Loaded routing** — tasks go to the least busy worker, not randomly.
+// Unpacking task (worker thread):
+int client_fd = (int)(intptr_t)arg;
+```
 
 ---
 
-## 28. Architecture: How HTTP and Task Assigner Connect
+## 28. Comprehensive Benchmark: CPU Task Assigner vs. Native Linux Scheduler
 
-```
-Client (curl/ab)
-    |
-    | TCP connect(:8080)
-    v
-accept() in main thread
-    |
-    | threadpool_add(pool, http_handle_request, client_fd, TASK_TYPE_HTTP)
-    v
-Scheduler selects worker (Least-Loaded)
-    |
-    | worker_t dequeues task, unlocks, calls:
-    v
-http_handle_request(client_fd)
-    |  recv() HTTP request
-    |  snprintf() JSON body
-    |  send() HTTP response
-    |  close(client_fd)
-    v
-Worker free, picks next task
-```
+We tested both architectures with ApacheBench (`ab -n 10000`) across 3 concurrency levels ($c=10$, $c=50$, $c=100$) on an ARM64 (aarch64) Kali Linux machine with 3 physical cores.
+
+### A. Results Across Concurrency Levels
+
+| Concurrency | Metric | Our Task Assigner (Pinned Pool) | Linux Baseline (On-demand `pthread_create`) | Performance Gain |
+|---|---|---|---|---|
+| **$c=10$ (Low)** | Throughput<br>Mean latency<br>Median (p50)<br>Tail (p99)<br>Worst Case | **37,152 req/s**<br>**0.269 ms**<br>**0 ms**<br>**1 ms**<br>**3 ms** | 23,048 req/s<br>0.434 ms<br>0 ms<br>2 ms<br>**80 ms** | **+61.2% req/s**<br>**1.6x faster**<br>Equal<br>**2x lower tail**<br>**26.6x better** |
+| **$c=50$ (Medium)** | Throughput<br>Mean latency<br>Median (p50)<br>Tail (p99)<br>Worst Case | **40,998 req/s**<br>**1.220 ms**<br>**1 ms**<br>**2 ms**<br>**6 ms** | 31,902 req/s<br>1.567 ms<br>1 ms<br>5 ms<br>7 ms | **+28.5% req/s**<br>**1.3x faster**<br>Equal<br>**2.5x lower tail**<br>**Better** |
+| **$c=100$ (High)** | Throughput<br>Mean latency<br>Median (p50)<br>Tail (p99)<br>Worst Case | **39,849 req/s**<br>**2.509 ms**<br>**2 ms**<br>9 ms<br>11 ms | 32,272 req/s<br>3.099 ms<br>3 ms<br>**7 ms**<br>**10 ms** | **+23.5% req/s**<br>**1.2x faster**<br>**Better**<br>Baseline (more threads)<br>Baseline |
+
+### B. Analysis of Key Phenomena
+1. **Thread-Spawn Jitter (The 80ms Spike)**:
+   - At $c=10$, the Linux baseline showed a worst-case latency of **80 ms** compared to **3 ms** for our task assigner.
+   - *Reason*: On-demand `pthread_create()` forces the kernel to call `clone()`, allocate an 8MB virtual memory stack, initialize thread control blocks, and schedule the thread cold. Under sudden request bursts, this incurs severe latency spikes.
+   - Our thread pool maintains pre-spawned, hot worker threads waiting on condition variables, eliminating spawn latency completely.
+2. **The Concurrency Sweet Spot**:
+   - For a fixed pool of 3 workers on 3 physical cores, the throughput peaked at $c=50$ (**~41,000 req/s**). At this concurrency, queues were constantly supplied without worker starvation.
+   - At $c=100$, queue depth increased, leading to higher queuing latency for our fixed 3-worker model, while the baseline was able to spawn more threads in parallel at the cost of high context switching.
+
+---
+
+## 29. Evaluating CPU Pinning: Pinned Pool vs. Unpinned Pool
+
+To isolate the exact impact of hardware thread affinity (`pthread_setaffinity_np`), we added an unpinned pool build (`make load_balancer_unpinned` with `-DDISABLE_CPU_PINNING`) where the thread pool and queue architecture are identical, but worker threads are free to migrate across CPU cores.
+
+### A. Experimental Comparison (10,000 requests per round)
+
+| Concurrency | Metric | Pinned Pool (`load_balancer`) | Unpinned Pool (`load_balancer_unpinned`) |
+|---|---|---|---|
+| **$c=10$** | Throughput<br>Mean latency<br>Tail (p99)<br>Max latency | 36,360 req/s<br>0.275 ms<br>1 ms<br>5 ms | **41,888 req/s**<br>**0.239 ms**<br>1 ms<br>**4 ms** |
+| **$c=50$** | Throughput<br>Mean latency<br>Tail (p99)<br>Max latency | 38,354 req/s<br>1.304 ms<br>3 ms<br>6 ms | **47,082 req/s**<br>**1.062 ms**<br>**2 ms**<br>**5 ms** |
+| **$c=100$** | Throughput<br>Mean latency<br>Tail (p99)<br>Max latency | 37,861 req/s<br>2.641 ms<br>13 ms<br>17 ms | **47,879 req/s**<br>**2.089 ms**<br>**7 ms**<br>**10 ms** |
+
+### B. Why Did the Unpinned Pool Achieve Higher Throughput in This Network Test?
+This is a critical architectural discovery:
+1. **The Network I/O Factor**:
+   - The workload is an HTTP server running on `localhost`.
+   - The Linux kernel TCP/IP network stack (software interrupts, network packet handling, `ksoftirqd`) and the ApacheBench benchmarking client (`ab`) also require CPU time!
+2. **Core Contention Under Strict Pinning**:
+   - When our 3 workers are strictly pinned to Cores 0, 1, and 2, and the machine only has 3 physical cores, the main listening thread (`accept()`), the kernel network stack, and `ab` itself are forced to share cores with pinned workers.
+   - When a pinned worker is bound to Core 0, and `ksoftirqd` or `ab` runs on Core 0, the worker cannot execute on Core 1 even if Core 1 is temporarily idle.
+3. **Dynamic Kernel Load Balancing**:
+   - In the **unpinned pool**, the Linux CFS scheduler dynamically migrates workers to whichever core is momentarily unoccupied by kernel socket routines or client processes.
+   - **Conclusion**:
+     - **CPU-bound tasks with private data** (e.g. matrix math, image processing, scientific simulation): **Strict CPU Pinning wins** because L1/L2 cache locality dominates.
+     - **I/O-heavy workloads where kernel subsystems share the same CPU cores**: An **unpinned or soft-pinned pool** allows the OS to balance kernel I/O interrupts and user-space worker threads more fluidly.
+
